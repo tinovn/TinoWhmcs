@@ -83,6 +83,13 @@ class TinoApi
         return self::http('POST', '/domain/lookup', ['name' => $name], null);
     }
 
+    /** Public endpoint, no auth: TLD list with per-period prices (VND). */
+    public static function tlds()
+    {
+        $r = self::http('GET', '/cart/domain/tlds', [], null);
+        return isset($r['tlds']) && is_array($r['tlds']) ? $r['tlds'] : [];
+    }
+
     /** @return string error text from an API response */
     public static function error($resp, $fallback = 'Tino API: phản hồi không hợp lệ')
     {
@@ -143,7 +150,7 @@ class TinoApi
 
     // ------------------------------------------------------------ auth
 
-    private function call($method, $path, array $data)
+    public function call($method, $path, array $data = [])
     {
         $r = self::http($method, $path, $data, $this->token());
         if (self::isAuthError($r)) {

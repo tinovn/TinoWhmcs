@@ -18,9 +18,14 @@ Vào **Configuration → System Settings → Domain Registrars**, kích hoạt *
 
 `POST /login` → `token` + `refresh`. Mọi request gửi `Authorization: Bearer`. Khi API trả `invalid_token` / `token_expired`, module gọi `POST /token` (refresh, xoay cả hai token) rồi thử lại; refresh hỏng thì đăng nhập lại. Token và danh sách địa phương (cache 1 ngày) lưu trong bảng `mod_tinowhmcs` (tự tạo).
 
+## Chức năng
+
+Đăng ký, chuyển về, gia hạn, đồng bộ, nameserver, khoá chuyển, ID protection, EPP, liên hệ, child nameserver, kiểm tra tên miền, nhập giá TLD (`GetTldPricing`, giá 1 năm, tiền VND) và quản lý bản ghi DNS (A, AAAA, CNAME, MX, TXT/SPF) trên zone DNS Tino của tên miền.
+
 ## Kiểm tra
 
 ```sh
 php modules/registrars/tinowhmcs/tests/run.php                       # kiểm tra thuần
 TINO_USER=... TINO_PASS=... php modules/registrars/tinowhmcs/tests/run.php   # + gọi API thật (chỉ đọc)
+TINO_LIVE_WRITE=1 ...                                                          # + thêm/xoá 1 bản ghi TXT thử trên zone DNS
 ```

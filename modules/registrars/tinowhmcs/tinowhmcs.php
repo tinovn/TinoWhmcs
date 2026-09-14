@@ -11,6 +11,7 @@ if (!defined('WHMCS')) {
 require_once __DIR__ . '/lib/TinoApi.php';
 
 use TinoWhmcs\TinoApi;
+use WHMCS\Domain\TopLevel\ImportItem;
 use WHMCS\Domains\DomainLookup\ResultsList;
 use WHMCS\Domains\DomainLookup\SearchResult;
 
@@ -207,6 +208,41 @@ function tinowhmcs_CheckAvailability($params)
     return $results;
 }
 
+/** Admin > Domain Pricing > Import: 1-year prices from /cart/domain/tlds (VND; -1 means not offered). */
+function tinowhmcs_GetTldPricing($params)
+{
+    $results = new \WHMCS\Results\ResultsList();
+    foreach (TinoApi::tlds() as $tld) {
+        $years = [];
+        $one = null;
+        foreach (isset($tld['periods']) ? $tld['periods'] : [] as $period) {
+            $years[] = (int) $period['period'];
+            if ((int) $period['period'] === 1) {
+                $one = $period;
+            }
+        }
+        if (!$one || (float) $one['register'] < 0) {
+            continue;
+        }
+        $item = (new ImportItem())
+            ->setTld($tld['tld'])
+            ->setCurrency('VND')
+            ->setMinYears(min($years))
+            ->setMaxYears(max($years))
+            ->setRegistrationPrice((float) $one['register'])
+            ->setRenewalPrice((float) $one['renew'])
+            ->setEppRequired(substr($tld['tld'], -3) !== '.vn');
+        if ((float) $one['transfer'] >= 0) {
+            $item->setTransferPrice((float) $one['transfer']);
+        }
+        if ((float) $one['redemption'] > 0) {
+            $item->setRedemptionFeePrice((float) $one['redemption'])->setRedemptionFeeDays(30);
+        }
+        $results[] = $item;
+    }
+    return $results;
+}
+
 function tinowhmcs_Sync($params)
 {
     return tinowhmcs_try(function () use ($params) {
@@ -339,6 +375,141 @@ function tinowhmcs_SaveContactDetails($params)
         $api = tinowhmcs_api($params);
         $r = $api->put('/domain/' . $api->domainId(tinowhmcs_domain($params)) . '/contact', ['contact_info' => $info]);
         return !empty($r['error']) ? ['error' => TinoApi::error($r)] : ['success' => true];
+    });
+}
+
+// ------------------------------------------------------------------ DNS (Tino DNS zone of the domain)
+
+/** @return string zone path "/service/{sid}/dns/{zid}"; throws when the domain has no Tino DNS zone */
+function tinowhmcs_zone(TinoApi $api, $domain)
+{
+    $r = $api->get('/domain/' . $api->domainId($domain));
+    if (empty($r['details']['dns']['service_id']) || empty($r['details']['dns']['zone_id'])) {
+        throw new Exception("Tên miền {$domain} không có zone DNS tại Tino (cần trỏ về ns1/ns2.tino.vn). " . (!empty($r['error']) ? TinoApi::error($r) : ''));
+    }
+    return '/service/' . $r['details']['dns']['service_id'] . '/dns/' . $r['details']['dns']['zone_id'];
+}
+
+function tinowhmcs_dns_types()
+{
+    return ['A', 'AAAA', 'CNAME', 'MX', 'TXT'];
+}
+
+/** Normalise one record to ['hostname' (relative, '@' = apex), 'type', 'address' (TXT unquoted), 'priority'] */
+function tinowhmcs_dns_norm(array $rec, $domain)
+{
+    $host = strtolower(trim($rec['hostname']));
+    $host = preg_replace('/\.?' . preg_quote($domain, '/') . '\.?$/', '', $host);
+    $type = strtoupper(trim($rec['type'])) === 'SPF' ? 'TXT' : strtoupper(trim($rec['type']));
+    $addr = trim($rec['address']);
+    if ($type === 'TXT') {
+        $addr = trim($addr, '"');
+    }
+    return [
+        'hostname' => $host === '' ? '@' : $host,
+        'type' => $type,
+        'address' => $addr,
+        'priority' => $type === 'MX' ? (int) $rec['priority'] : 0,
+    ];
+}
+
+function tinowhmcs_dns_key(array $rec)
+{
+    return implode('|', [$rec['hostname'], $rec['type'], $rec['address'], $rec['priority']]);
+}
+
+/** @return array [record id => normalised record] of the zone's managed records */
+function tinowhmcs_dns_records(TinoApi $api, $zone, $domain)
+{
+    $r = $api->get($zone);
+    if (!empty($r['error'])) {
+        throw new Exception(TinoApi::error($r));
+    }
+    $out = [];
+    foreach (isset($r['records']) ? (array) $r['records'] : [] as $rec) {
+        if (in_array($rec['type'], tinowhmcs_dns_types(), true)) {
+            $out[$rec['id']] = tinowhmcs_dns_norm(['hostname' => $rec['name'], 'type' => $rec['type'], 'address' => $rec['content'], 'priority' => $rec['priority']], $domain);
+        }
+    }
+    return $out;
+}
+
+/** Pure diff: which existing ids to delete and which wanted records to create. */
+function tinowhmcs_dns_diff(array $existing, array $wanted)
+{
+    $have = [];
+    foreach ($existing as $id => $rec) {
+        $have[tinowhmcs_dns_key($rec)] = $id;
+    }
+    $keep = [];
+    $create = [];
+    foreach ($wanted as $rec) {
+        $key = tinowhmcs_dns_key($rec);
+        if (isset($have[$key])) {
+            $keep[$key] = true;
+        } elseif (!isset($create[$key])) {
+            $create[$key] = $rec;
+        }
+    }
+    $delete = [];
+    foreach ($have as $key => $id) {
+        if (!isset($keep[$key])) {
+            $delete[] = $id;
+        }
+    }
+    return [$delete, array_values($create)];
+}
+
+function tinowhmcs_GetDNS($params)
+{
+    return tinowhmcs_try(function () use ($params) {
+        $api = tinowhmcs_api($params);
+        $domain = tinowhmcs_domain($params);
+        $out = [];
+        foreach (tinowhmcs_dns_records($api, tinowhmcs_zone($api, $domain), $domain) as $rec) {
+            $out[] = ['hostname' => $rec['hostname'], 'type' => $rec['type'], 'address' => $rec['address'], 'priority' => $rec['type'] === 'MX' ? $rec['priority'] : ''];
+        }
+        return $out;
+    });
+}
+
+function tinowhmcs_SaveDNS($params)
+{
+    return tinowhmcs_try(function () use ($params) {
+        $domain = tinowhmcs_domain($params);
+        $wanted = [];
+        foreach (isset($params['dnsrecords']) ? (array) $params['dnsrecords'] : [] as $rec) {
+            if (trim($rec['address']) === '') {
+                continue; // blank row in the WHMCS form
+            }
+            $rec = tinowhmcs_dns_norm($rec, $domain);
+            if (!in_array($rec['type'], tinowhmcs_dns_types(), true)) {
+                return ['error' => "Loại bản ghi {$rec['type']} không được Tino DNS hỗ trợ (chỉ A, AAAA, CNAME, MX, TXT/SPF)."];
+            }
+            $wanted[] = $rec;
+        }
+        $api = tinowhmcs_api($params);
+        $zone = tinowhmcs_zone($api, $domain);
+        list($delete, $create) = tinowhmcs_dns_diff(tinowhmcs_dns_records($api, $zone, $domain), $wanted);
+        foreach ($delete as $id) {
+            $r = $api->call('DELETE', $zone . '/records/' . $id);
+            if (!empty($r['error'])) {
+                return ['error' => 'Xoá bản ghi thất bại: ' . TinoApi::error($r)];
+            }
+        }
+        foreach ($create as $rec) {
+            $r = $api->post($zone . '/records', [
+                'name' => $rec['hostname'] === '@' ? $domain : $rec['hostname'] . '.' . $domain,
+                'type' => $rec['type'],
+                'content' => $rec['address'],
+                'priority' => $rec['priority'],
+                'ttl' => 3600,
+            ]);
+            if (!empty($r['error'])) {
+                return ['error' => "Thêm bản ghi {$rec['type']} {$rec['hostname']} thất bại: " . TinoApi::error($r)];
+            }
+        }
+        return ['success' => true];
     });
 }
 

@@ -24,6 +24,11 @@ if (!class_exists('WHMCS\Database\Capsule')) {
         public function insert($row) { self::$rows[$row["k"]] = $row["v"]; return true; }
     }');
 }
+if (!class_exists('WHMCS\Domain\TopLevel\ImportItem')) {
+    eval('namespace WHMCS\Results; class ResultsList extends \ArrayObject {}');
+    eval('namespace WHMCS\Domain\TopLevel; class ImportItem { public $v = [];
+        public function __call($m, $a) { $this->v[lcfirst(substr($m, 3))] = $a[0]; return $this; } }');
+}
 require __DIR__ . '/../tinowhmcs.php';
 
 use TinoWhmcs\TinoApi;
@@ -72,6 +77,21 @@ $t('nameservers: empty slots skipped', tinowhmcs_ns($base) === ['ns1.tino.vn', '
 $t('domain name: tld with or without dot', tinowhmcs_domain($base) === 'vidu.vn' && tinowhmcs_domain(['sld' => 'a', 'tld' => '.com.vn']) === 'a.com.vn');
 $r = tinowhmcs_order($base + ['additionalfields' => []], 'register');
 $t('order: incomplete contact rejected before any API call', isset($r['error']) && strpos($r['error'], 'Thiếu') === 0, json_encode($r, JSON_UNESCAPED_UNICODE));
+
+// ---------------------------------------------------------------- pure: DNS normalise + diff
+$n = function ($h, $ty, $a, $p = 0) { return tinowhmcs_dns_norm(['hostname' => $h, 'type' => $ty, 'address' => $a, 'priority' => $p], 'vidu.vn'); };
+$t('dns: apex/FQDN/relative hostnames normalise, TXT unquoted, SPF->TXT, MX priority kept',
+    $n('vidu.vn', 'A', '1.2.3.4')['hostname'] === '@' && $n('', 'A', '1.2.3.4')['hostname'] === '@'
+    && $n('www.vidu.vn', 'CNAME', 'vidu.vn')['hostname'] === 'www' && $n('WWW', 'cname', 'vidu.vn') === ['hostname' => 'www', 'type' => 'CNAME', 'address' => 'vidu.vn', 'priority' => 0]
+    && $n('@', 'SPF', '"v=spf1 -all"') === ['hostname' => '@', 'type' => 'TXT', 'address' => 'v=spf1 -all', 'priority' => 0]
+    && $n('@', 'MX', 'mx.tino.vn', '10')['priority'] === 10 && $n('@', 'A', '1.1.1.1', '10')['priority'] === 0);
+$existing = [1 => $n('@', 'A', '1.1.1.1'), 2 => $n('www', 'CNAME', 'vidu.vn'), 3 => $n('@', 'MX', 'mx.tino.vn', 10), 4 => $n('@', 'TXT', 'v=spf1 -all')];
+$wanted = [$n('@', 'A', '1.1.1.1'), $n('www', 'CNAME', 'vidu.vn'), $n('@', 'MX', 'mx.tino.vn', 20), $n('@', 'TXT', 'v=spf1 -all'), $n('@', 'TXT', 'v=spf1 -all'), $n('api', 'A', '2.2.2.2')];
+list($del, $add) = tinowhmcs_dns_diff($existing, $wanted);
+$t('dns diff: changed MX priority = delete+create, duplicates collapsed, unchanged kept', $del === [3] && count($add) === 2
+    && $add[0]['priority'] === 20 && $add[1]['hostname'] === 'api', json_encode([$del, $add]));
+list($del, $add) = tinowhmcs_dns_diff($existing, []);
+$t('dns diff: empty wanted deletes all managed records', $del === [1, 2, 3, 4] && $add === []);
 
 // ---------------------------------------------------------------- pure: additionalfields.php built from cached lists
 Capsule::$rows = [
@@ -134,6 +154,17 @@ $t('live: lookup of a random .vn is available', !empty($lk['avaliable']), json_e
 $lk = TinoApi::lookup('tino.vn');
 $t('live: lookup of tino.vn is taken', isset($lk['avaliable']) && !$lk['avaliable']);
 
+$pricing = tinowhmcs_GetTldPricing($params);
+$vn = null;
+foreach ($pricing as $item) {
+    if ($item->v['tld'] === '.vn') {
+        $vn = $item->v;
+    }
+}
+$t('live: GetTldPricing returns many TLDs incl. .vn in VND with 1-year prices', count($pricing) > 20 && $vn && $vn['currency'] === 'VND'
+    && $vn['registrationPrice'] > 0 && $vn['renewalPrice'] > 0 && $vn['minYears'] === 1 && $vn['maxYears'] >= 1 && $vn['eppRequired'] === false,
+    json_encode($vn));
+
 $domains = isset($r['domains']) ? $r['domains'] : [];
 if (!$domains) {
     echo "SKIP domain checks (account has no domains)\n";
@@ -153,6 +184,23 @@ $r = tinowhmcs_GetEPPCode($p);
 $t('live: GetEPPCode', isset($r['eppcode']) && !isset($r['error']), json_encode($r, JSON_UNESCAPED_UNICODE));
 $r = tinowhmcs_TransferSync($params + ['sld' => 'khong-ton-tai-' . mt_rand(), 'tld' => 'vn']);
 $t('live: TransferSync unknown domain => pending []', $r === [], json_encode($r));
+
+$r = tinowhmcs_GetDNS($p);
+$hasZone = !isset($r['error']);
+$t('live: GetDNS lists records (or explains missing zone)', $hasZone ? count($r) > 0 && isset($r[0]['hostname'], $r[0]['type'], $r[0]['address']) : strpos($r['error'], 'zone DNS') !== false, json_encode($r, JSON_UNESCAPED_UNICODE));
+if ($hasZone && getenv('TINO_LIVE_WRITE')) {
+    $before = $r;
+    $probe = ['hostname' => '_tinowhmcs-selfcheck', 'type' => 'TXT', 'address' => 'tinowhmcs selfcheck', 'priority' => ''];
+    $w = tinowhmcs_SaveDNS($p + ['dnsrecords' => array_merge($before, [$probe])]);
+    $mid = tinowhmcs_GetDNS($p);
+    $found = array_filter($mid, function ($x) { return $x['hostname'] === '_tinowhmcs-selfcheck' && $x['type'] === 'TXT' && $x['address'] === 'tinowhmcs selfcheck'; });
+    $t('live-write: SaveDNS adds the probe TXT and keeps the rest', !isset($w['error']) && count($found) === 1 && count($mid) === count($before) + 1, json_encode([$w, $mid], JSON_UNESCAPED_UNICODE));
+    $w = tinowhmcs_SaveDNS($p + ['dnsrecords' => $before]);
+    $after = tinowhmcs_GetDNS($p);
+    $t('live-write: SaveDNS with the original list removes the probe and nothing else', !isset($w['error']) && $after == $before, json_encode([$w, $after], JSON_UNESCAPED_UNICODE));
+} else {
+    echo "SKIP live DNS write (set TINO_LIVE_WRITE=1 on a domain with a Tino DNS zone)\n";
+}
 
 echo $fails ? "\n{$fails} FAILED\n" : "\nALL PASSED\n";
 exit($fails ? 1 : 0);
