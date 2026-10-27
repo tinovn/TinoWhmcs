@@ -1,7 +1,7 @@
 <?php
 /**
  * Tino Domain registrar module for WHMCS 8/9.
- * API: https://api.tino.vn (Bearer token, see lib/TinoApi.php).
+ * API: https://api.tino.vn/v1 with a personal API token (tinopat_…, see lib/TinoApi.php).
  */
 
 if (!defined('WHMCS')) {
@@ -11,6 +11,7 @@ if (!defined('WHMCS')) {
 require_once __DIR__ . '/lib/TinoApi.php';
 
 use TinoWhmcs\TinoApi;
+use WHMCS\Database\Capsule;
 use WHMCS\Domain\TopLevel\ImportItem;
 use WHMCS\Domains\DomainLookup\ResultsList;
 use WHMCS\Domains\DomainLookup\SearchResult;
@@ -24,30 +25,33 @@ function tinowhmcs_getConfigArray()
 {
     return [
         'FriendlyName' => ['Type' => 'System', 'Value' => 'Tino Domain'],
-        'Description' => ['Type' => 'System', 'Value' => 'Đăng ký tên miền qua api.tino.vn. Dùng email/mật khẩu tài khoản Tino; module tự lấy và làm mới token.'],
-        'Username' => ['FriendlyName' => 'Email tài khoản Tino', 'Type' => 'text', 'Size' => '40'],
-        'Password' => ['FriendlyName' => 'Mật khẩu', 'Type' => 'password', 'Size' => '40'],
+        'Description' => ['Type' => 'System', 'Value' => 'Đăng ký tên miền qua api.tino.vn bằng token API cá nhân của tài khoản Tino.'],
+        'ApiToken' => ['FriendlyName' => 'API Token', 'Type' => 'password', 'Size' => '60',
+            'Description' => 'tinopat_… tạo ở Client Area Tino → Token API. Quyền: domains:read, domains:write, dns:read, dns:write; '
+                . 'thêm domains:owner (bắt buộc giới hạn IP máy chủ WHMCS) để lấy mã EPP và sửa liên hệ.'],
     ];
 }
 
-/** Called by WHMCS when the registrar config is saved: verify the credentials. */
+/** Called by WHMCS when the registrar config is saved: verify the token, then drop the old email/password login. */
 function tinowhmcs_config_validate($params)
 {
     try {
-        $r = tinowhmcs_api($params)->get('/balance');
+        $r = tinowhmcs_api($params)->get('/domain');
         if (!empty($r['error'])) {
             throw new Exception(TinoApi::error($r));
         }
     } catch (Exception $e) {
-        throw new WHMCS\Exception\Module\InvalidConfiguration('Không đăng nhập được api.tino.vn: ' . $e->getMessage());
+        throw new WHMCS\Exception\Module\InvalidConfiguration('Không gọi được api.tino.vn: ' . $e->getMessage());
     }
+    TinoApi::forgetLogins();
+    Capsule::table('tblregistrars')->where('registrar', 'tinowhmcs')->whereIn('setting', ['Username', 'Password'])->delete();
 }
 
 // ------------------------------------------------------------------ helpers
 
 function tinowhmcs_api(array $p)
 {
-    return new TinoApi(trim($p['Username']), $p['Password']);
+    return new TinoApi(trim(isset($p['ApiToken']) ? $p['ApiToken'] : ''));
 }
 
 function tinowhmcs_domain(array $p)
