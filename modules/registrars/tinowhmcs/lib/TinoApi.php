@@ -2,12 +2,13 @@
 /**
  * Tino API client (https://api.tino.vn) for the WHMCS registrar module.
  *
- * Auth flow: POST /login (username/password) -> {token, refresh}. Every call sends
- * "Authorization: Bearer <token>". When the API answers invalid_token/token_expired/
- * unauthorized, the client refreshes via POST /token {refresh_token}; if that fails it
- * logs in again. Refresh rotates both tokens, so both are persisted after each refresh.
+ * Auth: a personal API token (tinopat_…) the customer makes in the Tino Client Area (Token API).
+ * Account calls go through the token gateway https://api.tino.vn/v1/<route> with
+ * "Authorization: Bearer <token>": only routes of the token's scopes (else 403 insufficient_scope),
+ * only from its allowed IPs when set (else 403 ip_not_allowed). Revoked/expired: 401 invalid_token.
+ * Public calls (lookup, TLD prices, VN locations) stay at the API root without a token.
  *
- * Tokens and the VN location lists are stored in the WHMCS DB table `mod_tinowhmcs`.
+ * The VN location lists are cached in the WHMCS DB table `mod_tinowhmcs`.
  */
 
 namespace TinoWhmcs;
@@ -17,25 +18,27 @@ use WHMCS\Database\Capsule;
 class TinoApi
 {
     const BASE = 'https://api.tino.vn';
+    const GATEWAY = '/v1';
     const TABLE = 'mod_tinowhmcs';
     const LOCATION_TTL = 86400;
 
     private static $tableReady = false;
 
-    private $username;
-    private $password;
-    private $key;
-    /** @var array|null ['token' => .., 'refresh' => .., 'exp' => ..] */
-    private $tokens = null;
+    /** Gateway error codes => what the WHMCS admin should fix. */
+    const HINTS = [
+        'invalid_token' => 'API Token sai, đã thu hồi hoặc hết hạn',
+        'insufficient_scope' => 'API Token thiếu quyền cho thao tác này',
+        'ip_not_allowed' => 'IP máy chủ WHMCS không có trong danh sách IP của API Token',
+    ];
 
-    public function __construct($username, $password)
+    private $token;
+
+    public function __construct($token)
     {
-        if ($username === '' || $password === '') {
-            throw new \Exception('Tino module: chưa cấu hình Username/Password.');
+        if (strpos($token, 'tinopat_') !== 0) {
+            throw new \Exception('Tino module: API Token phải là token cá nhân tinopat_… tạo ở Client Area Tino (Token API).');
         }
-        $this->username = $username;
-        $this->password = $password;
-        $this->key = 'auth:' . md5($username);
+        $this->token = $token;
     }
 
     // ------------------------------------------------------------ requests
@@ -94,7 +97,9 @@ class TinoApi
     public static function error($resp, $fallback = 'Tino API: phản hồi không hợp lệ')
     {
         if (!empty($resp['error'])) {
-            return implode(' | ', (array) $resp['error']);
+            return implode(' | ', array_map(function ($e) {
+                return isset(self::HINTS[$e]) ? self::HINTS[$e] . " ({$e})" : $e;
+            }, (array) $resp['error']));
         }
         return $fallback;
     }
@@ -152,65 +157,14 @@ class TinoApi
 
     public function call($method, $path, array $data = [])
     {
-        $r = self::http($method, $path, $data, $this->token());
-        if (self::isAuthError($r)) {
-            $this->tokens['exp'] = 0; // forces refresh, then login, in token()
-            $r = self::http($method, $path, $data, $this->token());
-        }
-        return $r;
+        return self::http($method, self::GATEWAY . $path, $data, $this->token);
     }
 
-    private function token()
+    /** Drops the email/password login tokens (auth:*) stored by module versions before the API token. */
+    public static function forgetLogins()
     {
-        if ($this->tokens === null) {
-            $this->tokens = static::loadStore($this->key) ?: [];
-        }
-        if (!empty($this->tokens['token']) && !empty($this->tokens['exp']) && $this->tokens['exp'] > time() + 60) {
-            return $this->tokens['token'];
-        }
-        if (!empty($this->tokens['refresh']) && $this->refresh()) {
-            return $this->tokens['token'];
-        }
-        $this->login();
-        return $this->tokens['token'];
-    }
-
-    private function login()
-    {
-        $r = self::http('POST', '/login', ['username' => $this->username, 'password' => $this->password], null);
-        if (empty($r['token'])) {
-            throw new \Exception('Tino API login thất bại: ' . self::error($r, 'wronglogin'));
-        }
-        $this->store($r['token'], isset($r['refresh']) ? $r['refresh'] : '');
-    }
-
-    private function refresh()
-    {
-        $r = self::http('POST', '/token', ['refresh_token' => $this->tokens['refresh']], null);
-        if (empty($r['token'])) {
-            return false;
-        }
-        $this->store($r['token'], !empty($r['refresh']) ? $r['refresh'] : $this->tokens['refresh']);
-        return true;
-    }
-
-    private function store($token, $refresh)
-    {
-        $this->tokens = ['token' => $token, 'refresh' => $refresh, 'exp' => self::jwtExp($token)];
-        static::saveStore($this->key, $this->tokens);
-    }
-
-    private static function jwtExp($jwt)
-    {
-        $parts = explode('.', $jwt);
-        $claims = isset($parts[1]) ? json_decode(base64_decode(strtr($parts[1], '-_', '+/')), true) : null;
-        return !empty($claims['exp']) ? (int) $claims['exp'] : time() + 3600;
-    }
-
-    private static function isAuthError($r)
-    {
-        $errors = isset($r['error']) ? (array) $r['error'] : [];
-        return (bool) array_intersect($errors, ['invalid_token', 'token_expired', 'unauthorized']);
+        self::ensureTable();
+        Capsule::table(self::TABLE)->where('k', 'like', 'auth:%')->delete();
     }
 
     // ------------------------------------------------------------ transport
@@ -244,8 +198,7 @@ class TinoApi
             $json = ['error' => ['Tino API: phản hồi không phải JSON']];
         }
         if (function_exists('logModuleCall')) {
-            logModuleCall('tinowhmcs', $method . ' ' . $path, $data, $body, $json,
-                array_filter([$bearer, isset($data['password']) ? $data['password'] : null, isset($data['refresh_token']) ? $data['refresh_token'] : null]));
+            logModuleCall('tinowhmcs', $method . ' ' . $path, $data, $body, $json, $bearer ? [$bearer] : []);
         }
         return $json;
     }

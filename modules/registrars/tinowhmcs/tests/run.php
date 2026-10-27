@@ -1,9 +1,9 @@
 <?php
 /**
  * Self-check for the Tino Domain module. Pure checks always run; live checks run when
- * TINO_USER / TINO_PASS are set (a real Tino account, read-only calls only):
+ * TINO_TOKEN is set (a personal API token of a real Tino account, read-only calls only):
  *
- *   TINO_USER=you@example.com TINO_PASS=secret php modules/registrars/tinowhmcs/tests/run.php
+ *   TINO_TOKEN=tinopat_... php modules/registrars/tinowhmcs/tests/run.php
  */
 
 define('WHMCS', true);
@@ -17,7 +17,9 @@ if (!class_exists('WHMCS\Database\Capsule')) {
         public function hasTable($t) { return true; }
         public function create($t, $fn) {}
         private $k;
-        public function where($c, $v) { $this->k = $v; return $this; }
+        public function where($c, $op, $v = null) { $this->k = $v === null ? $op : $v; return $this; }
+        public function delete() { $re = "/^" . str_replace("%", ".*", preg_quote($this->k, "/")) . "$/";
+            foreach (array_keys(self::$rows) as $k) { if (preg_match($re, $k)) { unset(self::$rows[$k]); } } return 1; }
         public function value($c) { return isset(self::$rows[$this->k]) ? self::$rows[$this->k] : null; }
         public function count() { return isset(self::$rows[$this->k]) ? 1 : 0; }
         public function update($row) { self::$rows[$this->k] = $row["v"]; return 1; }
@@ -78,6 +80,25 @@ $t('domain name: tld with or without dot', tinowhmcs_domain($base) === 'vidu.vn'
 $r = tinowhmcs_order($base + ['additionalfields' => []], 'register');
 $t('order: incomplete contact rejected before any API call', isset($r['error']) && strpos($r['error'], 'Thiếu') === 0, json_encode($r, JSON_UNESCAPED_UNICODE));
 
+// ---------------------------------------------------------------- pure: API token auth
+$threw = function ($p) {
+    try {
+        tinowhmcs_api($p);
+        return false;
+    } catch (Exception $e) {
+        return strpos($e->getMessage(), 'tinopat_') !== false;
+    }
+};
+$t('token: old email/password config and non-personal tokens rejected before any API call',
+    $threw(['Username' => 'a@b.vn', 'Password' => 'x']) && $threw(['ApiToken' => '']) && $threw(['ApiToken' => 'tinoat_' . str_repeat('a', 43)])
+    && !$threw(['ApiToken' => ' tinopat_' . str_repeat('a', 43) . ' ']));
+$e = TinoApi::error(['error' => ['insufficient_scope']]);
+$t('token: gateway codes explained, code kept, other errors unchanged', strpos($e, 'thiếu quyền') !== false && strpos($e, '(insufficient_scope)') !== false
+    && strpos(TinoApi::error(['error' => ['ip_not_allowed']]), 'IP máy chủ WHMCS') === 0 && TinoApi::error(['error' => ['wrong', 'x']]) === 'wrong | x', $e);
+Capsule::$rows = ['auth:abc' => '{"token":"jwt","refresh":"r"}', 'loc:states' => '{}'];
+TinoApi::forgetLogins();
+$t('token: forgetLogins drops stored login tokens, keeps location cache', array_keys(Capsule::$rows) === ['loc:states'], json_encode(Capsule::$rows));
+
 // ---------------------------------------------------------------- pure: DNS normalise + diff
 $n = function ($h, $ty, $a, $p = 0) { return tinowhmcs_dns_norm(['hostname' => $h, 'type' => $ty, 'address' => $a, 'priority' => $p], 'vidu.vn'); };
 $t('dns: apex/FQDN/relative hostnames normalise, TXT unquoted, SPF->TXT, MX priority kept',
@@ -111,13 +132,12 @@ $t('fields: owner_city dropdown holds every ward once', $byName['owner_city']['O
 $t('fields: required set on owner_* only', !empty($byName['owner_name']['Required']) && empty($byName['congty_ten']['Required']));
 
 // ---------------------------------------------------------------- live
-$user = getenv('TINO_USER');
-$pass = getenv('TINO_PASS');
-if (!$user || !$pass) {
-    echo "SKIP live checks (set TINO_USER/TINO_PASS)\n";
+$token = getenv('TINO_TOKEN');
+if (!$token) {
+    echo "SKIP live checks (set TINO_TOKEN)\n";
     exit($fails ? 1 : 0);
 }
-$params = ['Username' => $user, 'Password' => $pass];
+$params = ['ApiToken' => $token];
 Capsule::$rows = [];
 
 $states = TinoApi::states();
@@ -128,26 +148,10 @@ $t('live: ward map keys == province list', $states && !array_diff($states, array
 $t('live: HCM has wards', !empty($wards['Thành phố Hồ Chí Minh']) && count($wards['Thành phố Hồ Chí Minh']) > 50, count(isset($wards['Thành phố Hồ Chí Minh']) ? $wards['Thành phố Hồ Chí Minh'] : []));
 $t('live: location lists cached in store', isset(Capsule::$rows['loc:states'], Capsule::$rows['loc:wards']));
 
-$api = tinowhmcs_api($params);
-$r = $api->get('/domain');
-$key = 'auth:' . md5($user);
-$saved = json_decode(Capsule::$rows[$key], true);
-$t('live: login + GET /domain', !empty($r['success']), json_encode($r));
-$t('live: token/refresh/exp persisted', !empty($saved['token']) && !empty($saved['refresh']) && $saved['exp'] > time());
-
-$saved['token'] = 'bad.token.value';
-Capsule::$rows[$key] = json_encode($saved);
-$api = tinowhmcs_api($params);
-$r = $api->get('/domain');
-$after = json_decode(Capsule::$rows[$key], true);
-$t('live: bad token -> recovered via refresh, new tokens stored', !empty($r['success']) && $after['token'] !== 'bad.token.value' && $after['refresh'] !== $saved['refresh']);
-
-$after['token'] = 'bad.token.value';
-$after['refresh'] = 'bad.refresh.value';
-Capsule::$rows[$key] = json_encode($after);
-$api = tinowhmcs_api($params);
-$r = $api->get('/domain');
-$t('live: bad token + bad refresh -> recovered via login', !empty($r['success']) && json_decode(Capsule::$rows[$key], true)['token'] !== 'bad.token.value');
+$r = tinowhmcs_api($params)->get('/domain');
+$t('live: GET /v1/domain with the token', !empty($r['success']), json_encode($r));
+$bad = tinowhmcs_api(['ApiToken' => 'tinopat_' . str_repeat('A', 43)])->get('/domain');
+$t('live: unknown token -> invalid_token', strpos(TinoApi::error($bad), '(invalid_token)') !== false, json_encode($bad));
 
 $lk = TinoApi::lookup('tino-whmcs-selfcheck-' . mt_rand(1000, 9999) . '.vn');
 $t('live: lookup of a random .vn is available', !empty($lk['avaliable']), json_encode($lk));
