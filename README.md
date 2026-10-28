@@ -38,6 +38,7 @@ Token không sửa được quyền, IP hay hạn dùng sau khi tạo: muốn đ
 | `API Token sai, đã thu hồi hoặc hết hạn (invalid_token)` | Tạo token mới và dán lại. |
 | `API Token thiếu quyền cho thao tác này (insufficient_scope)` | Token thiếu quyền cho chức năng vừa dùng (ví dụ lấy EPP cần `domains:owner`). Tạo token mới đủ quyền. |
 | `IP máy chủ WHMCS không có trong danh sách IP của API Token (ip_not_allowed)` | IP máy chủ WHMCS gọi ra ngoài khác IP đã khai. Tạo token mới với đúng IP (cả IPv6 nếu có). |
+| `No nameservers are defined for the server this domain is assigned to. Please correct and try again.` | Lỗi do WHMCS báo, chưa gọi tới module (Module Log không có dòng `tinowhmcs` lúc lỗi). Tên miền gắn với dịch vụ hosting mà server của dịch vụ đó chưa có nameserver: **Configuration → System Settings → Servers** → sửa server, điền phần Nameservers. Tên miền đặt riêng, không kèm hosting: **General Settings → tab Domains** → Default Nameserver. Nếu có dịch vụ khác (kể cả đã huỷ) dùng tên miền này làm Domain/hostname thì đổi hostname đó. Module không có ô nameserver mặc định; NS mặc định nằm trong General Settings của WHMCS. |
 
 ## Cài đặt
 
